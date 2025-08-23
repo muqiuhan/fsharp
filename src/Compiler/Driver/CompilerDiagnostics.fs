@@ -39,6 +39,7 @@ open FSharp.Compiler.Text.Range
 open FSharp.Compiler.TypedTree
 open FSharp.Compiler.TypedTreeBasics
 open FSharp.Compiler.TypedTreeOps
+open Friadne
 
 #if DEBUG
 let showAssertForUnexpectedException = ref true
@@ -2018,7 +2019,7 @@ let SanitizeFileName fileName implicitIncludeDir =
             fullPath
         // if the file name is rooted in the current directory, return the relative path
         else
-            fullPath.Replace(currentDir + "\\", "")
+            fullPath.Replace(currentDir + "\\\\", "")
     with _ ->
         fileName
 
@@ -2054,7 +2055,7 @@ type FormattedDiagnostic =
     | Short of FSharpDiagnosticSeverity * string
     | Long of FSharpDiagnosticSeverity * FormattedDiagnosticDetailedInfo
 
-let FormatDiagnosticLocation (tcConfig: TcConfig) (m: Range) : FormattedDiagnosticLocation =
+let FormatDiagnosticLocation (tcConfig: TcConfig) (m: range) : FormattedDiagnosticLocation =
     if equals m rangeStartup || equals m rangeCmdArgs then
         {
             Range = m
@@ -2119,9 +2120,7 @@ let FormatDiagnosticLocation (tcConfig: TcConfig) (m: Range) : FormattedDiagnost
                 else
                     "", m, file
             | DiagnosticStyle.Rich ->
-                let file = file.Replace('/', Path.DirectorySeparatorChar)
-                let m = withStart (mkPos m.StartLine (m.StartColumn + 1)) m
-                (sprintf "\n  --> %s (%d,%d)" file m.StartLine m.StartColumn), m, file
+                "", m, file.Replace('/', Path.DirectorySeparatorChar)
 
         {
             Range = m
@@ -2132,6 +2131,48 @@ let FormatDiagnosticLocation (tcConfig: TcConfig) (m: Range) : FormattedDiagnost
 
 /// returns sequence that contains Diagnostic for the given error + Diagnostic for all related errors
 let CollectFormattedDiagnostics (tcConfig: TcConfig, severity: FSharpDiagnosticSeverity, diagnostic: PhasedDiagnostic, suggestNames: bool) =
+    let formatWithFriadne (diagnostic: PhasedDiagnostic) =
+        let oldOut = Console.Out
+        use writer = new System.IO.StringWriter()
+        Console.SetOut(writer)
+        try
+            let friadneSeverity =
+                match severity with
+                | FSharpDiagnosticSeverity.Error -> Friadne.Error
+                | FSharpDiagnosticSeverity.Warning -> Friadne.Warning
+                | _ -> Friadne.Info
+
+            let toFriadneRange (r: range) =
+                { Start = { Line = r.StartLine; Column = r.StartColumn }
+                  End = { Line = r.EndLine; Column = r.EndColumn } }
+
+            let toFriadneLocation (r: range) =
+                { FileName = r.FileName
+                  Range = toFriadneRange r }
+
+            let printDiagnostic (d: Friadne.Diagnostic) =
+                Diagnostics.print d
+                writer.ToString()
+
+            match diagnostic.Exception with
+            | ConstraintSolverTypesNotInEqualityRelation(denv, ty1, ty2, m, m2, _) ->
+                let type1Str, type2Str, _ = NicePrint.minimalStringsOfTwoTypes denv ty1 ty2
+                let diag =
+                    Diagnostics.createError "FS" diagnostic.Number "Type mismatch" (toFriadneLocation m)
+                    |> Diagnostics.withAnnotation (toFriadneRange m) (sprintf "This expression was expected to have type '%s'" type1Str) friadneSeverity
+                    |> Diagnostics.withAnnotation (toFriadneRange m2) (sprintf "but here has type '%s'" type2Str) Friadne.Info
+                printDiagnostic diag
+
+            | UndefinedName(_, kind, id, _) ->
+                let diag =
+                    Diagnostics.createError "FS" diagnostic.Number (kind id.idText) (toFriadneLocation id.idRange)
+                    |> Diagnostics.withAnnotation (toFriadneRange id.idRange) (sprintf "The value or constructor '%s' is not defined." id.idText) friadneSeverity
+                printDiagnostic diag
+            | e ->
+                Diagnostics.createError "FS" diagnostic.Number diagnostic.Subcategory (toFriadneLocation diagnostic.Range)
+                |> Diagnostics.withAnnotation (toFriadneRange id.idRange) (sprintf "The value or constructor '%s' is not defined." id.idText) friadneSeverity
+        finally
+            Console.SetOut(oldOut)
 
     match diagnostic.Exception with
     | ReportedError _ ->
@@ -2167,7 +2208,7 @@ let CollectFormattedDiagnostics (tcConfig: TcConfig, severity: FSharpDiagnosticS
                 | DiagnosticStyle.Default
                 | DiagnosticStyle.Test -> sprintf "%s FS%04d: " message errorNumber
                 | DiagnosticStyle.VisualStudio -> sprintf "%s %s FS%04d: " subcategory message errorNumber
-                | DiagnosticStyle.Rich -> sprintf "%s FS%04d: " message errorNumber
+                | DiagnosticStyle.Rich -> "" // Friadne handles the whole output 
 
             let canonical: FormattedDiagnosticCanonicalInformation =
                 {
@@ -2182,8 +2223,9 @@ let CollectFormattedDiagnostics (tcConfig: TcConfig, severity: FSharpDiagnosticS
                 | DiagnosticStyle.Gcc
                 | DiagnosticStyle.Default
                 | DiagnosticStyle.Test
-                | DiagnosticStyle.Rich
                 | DiagnosticStyle.VisualStudio -> diagnostic.FormatCore(tcConfig.flatErrors, suggestNames)
+                | DiagnosticStyle.Rich -> formatWithFriadne diagnostic
+
 
             let context =
                 match tcConfig.diagnosticStyle with
@@ -2191,30 +2233,8 @@ let CollectFormattedDiagnostics (tcConfig: TcConfig, severity: FSharpDiagnosticS
                 | DiagnosticStyle.Gcc
                 | DiagnosticStyle.Default
                 | DiagnosticStyle.Test
-                | DiagnosticStyle.VisualStudio -> None
-                | DiagnosticStyle.Rich ->
-                    match diagnostic.Range with
-                    | Some m ->
-                        let m = m.ApplyLineDirectives()
-
-                        let content =
-                            m.FileName
-                            |> FileSystem.GetFullFilePathInDirectoryShim tcConfig.implicitIncludeDir
-                            |> System.IO.File.ReadAllLines
-
-                        if m.StartLine = m.EndLine then
-                            $"\n  {m.StartLine} | {content[m.StartLine - 1]}\n"
-                            + $"""{String.make (m.StartColumn + 6) ' '}{String.make (m.EndColumn - m.StartColumn) '^'}"""
-                            |> Some
-                        else
-                            content
-                            |> fun lines -> Array.sub lines (m.StartLine - 1) (m.EndLine - m.StartLine - 1)
-                            |> Array.fold
-                                (fun (context, lineNumber) line -> (context + $"\n{lineNumber} | {line}", lineNumber + 1))
-                                ("", (m.StartLine))
-                            |> fst
-                            |> Some
-                    | None -> None
+                | DiagnosticStyle.VisualStudio
+                | DiagnosticStyle.Rich -> None
 
             let entry: FormattedDiagnosticDetailedInfo =
                 {
@@ -2267,16 +2287,8 @@ type PhasedDiagnostic with
                     buf.AppendString details.Canonical.TextRepresentation
                     buf.AppendString details.Message
                 | DiagnosticStyle.Rich ->
-                    buf.AppendString details.Canonical.TextRepresentation
+                    // For fancy, the message is the full output from Friadne
                     buf.AppendString details.Message
-
-                    match details.Location with
-                    | Some l when not l.IsEmpty ->
-                        buf.AppendString l.TextRepresentation
-
-                        if details.Context.IsSome then
-                            buf.AppendString details.Context.Value
-                    | _ -> ()
 
     member diagnostic.OutputContext(buf, prefix, fileLineFunction) =
         match diagnostic.Range with
